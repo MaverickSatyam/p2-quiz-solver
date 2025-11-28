@@ -78,17 +78,25 @@ async def download_files(links):
 async def generate_solution(instruction, file_paths):
     files_context = "\n".join([f"- {path}" for path in file_paths])
     
-    system_prompt = """
-    You are an autonomous data analyst.
-    1. READ the user instruction.
-    2. WRITE a Python script to solve the task.
-    3. OUTPUT a JSON object containing the code and the submission URL.
-    
-    The code must:
-    - Print the FINAL ANSWER to stdout.
-    - Handle errors gracefully.
-    - Use pandas, numpy, pdfplumber, etc. as needed.
-    """
+    system_prompt = f"""
+        You are an autonomous Python data analyst. Your ONLY goal is to solve the task.
+        
+        You MUST respond with a single JSON object. DO NOT include any text, conversation, or markdown (```json) outside of the final JSON object.
+        
+        The JSON object MUST have two keys: "submit_url" (string) and "python_code" (string).
+        
+        Rules for the 'python_code' value:
+        1. The code must be a single, complete Python script string (do NOT wrap it in ```python).
+        2. The script must read the instructions and files, calculate the final answer.
+        3. The script MUST print the FINAL ANSWER to stdout ONLY.
+        
+        Rules for the 'submit_url' value:
+        1. Extract the submission URL from the instructions. It can be relative (e.g., /submit) or absolute.
+        2. If no files are listed in the Context Files section, ignore the file_paths.
+        
+        Context Files:
+        {files_context}
+        """
     
     user_prompt = f"""
     Context Files:
