@@ -230,6 +230,7 @@ async def run_quiz_agent(start_url, email, secret):
             url_found = False
             submit_url = current_submit_url
             
+            
             # 1. Check AI result first (prefers AI's output)
             if submit_url and submit_url.startswith('https'):
                 url_found = True
