@@ -1,0 +1,44 @@
+fastapi
+uvicorn
+playwright
+httpx
+requests
+tenacity
+openai
+pandas
+numpy
+beautifulsoup4
+pdfplumber
+pytesseract
+pillow
+python-dotenv
+# --- API Server & Async Core ---
+fastapi>=0.100.0
+uvicorn[standard]>=0.20.0
+httpx>=0.24.0      # Async HTTP client for downloading files/submitting answers
+python-dotenv>=1.0.0 # For managing secrets/API keys
+
+# --- Browser Automation & Scraping ---
+playwright>=1.35.0 # For rendering the JS-heavy quiz pages
+beautifulsoup4>=4.12.0 # For parsing HTML efficiently
+
+# --- Logic & Resilience ---
+openai>=1.0.0      # To communicate with GPT-4o
+tenacity>=8.2.0    # CRITICAL: For exponential backoff (fixing 429 errors)
+
+# --- Data Analysis & Processing (The Agent's Toolkit) ---
+pandas>=2.0.0      # For CSV/Excel data manipulation
+numpy>=1.24.0      # For numerical calculations
+scikit-learn>=1.3.0 # For basic ML/statistical tasks mentioned in prompt
+scipy>=1.10.0      # For advanced statistical functions
+
+# --- File & Document Parsing ---
+pdfplumber>=0.10.0 # Best for extracting tables from PDFs
+pypdf>=3.12.0      # General PDF text extraction
+openpyxl>=3.1.0    # For reading Excel (.xlsx) files
+python-multipart>=0.0.6 # Handling form data if needed
+
+# --- Image & Vision ---
+Pillow>=10.0.0     # Image processing
+pytesseract>=0.3.10 # OCR (Requires Tesseract binary installed on OS)
+matplotlib>=3.7.0  # If you need to generate charts
