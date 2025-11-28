@@ -3,6 +3,7 @@ import os
 import re
 import json
 import httpx
+from urllib.parse import urlparse, urljoin
 import subprocess
 import traceback
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
@@ -155,27 +156,56 @@ async def run_quiz_agent(start_url, email, secret):
             code = plan.get("python_code")
             submit_url = plan.get("submit_url")
 
+            # --- DEBUG CODE ---
+            print("\n--- AI GENERATED CODE START ---")
+            print(code)
+            print("--- AI GENERATED CODE END ---\n")
+            # ------------------
+
             # CRITICAL: Step B/C - Robust URL Extraction and Validation
             url_found = False
 
-            # 1. Check AI result first
+            # 1. Check AI result first (prefers AI's output)
             if submit_url and submit_url.startswith('http'):
                 url_found = True
             else:
-                # 2. Fallback: Search the entire page text for a submit URL
-                print("⚠️ AI missed the submit URL, applying fallback search...")
-                # This regex is more liberal, looking for any https/http URL with a 'submit' word nearby
-                match = re.search(r'(https?://[^\s]+submit[^\s]*)', text, re.IGNORECASE)
-                if match: 
-                    submit_url = match.group(1).strip()
-                    # Clean up any trailing characters like quotes or periods
-                    submit_url = submit_url.rstrip('".')
-                    url_found = True
+                # 2. Fallback: Search the entire page text for either a full URL or a relative path
+                print("⚠️ AI missed the submit URL, applying dynamic fallback search...")
+                
+                # Regex 1: Look for any relative path that starts with a slash (/) and contains 'submit', 'answer', or 'post'
+                # This is more dynamic than just looking for '/submit'
+                match_relative = re.search(r'(/[^/\s]+(?:submit|answer|post|quiz)[^\s]*)', text, re.IGNORECASE)
+                
+                # Regex 2: Look for full https:// or http:// URL
+                match_absolute = re.search(r'(https?://[^\s]+)', text, re.IGNORECASE)
 
+                if match_relative:
+                    # **NEW DYNAMIC LOGIC:** Use urljoin to correctly combine base URL and relative path
+                    relative_path = match_relative.group(1).strip().rstrip('.,\'"')
+                    
+                    # urljoin handles combining the current page's base with the relative path gracefully.
+                    submit_url = urljoin(current_url, relative_path)
+                    url_found = True
+                    print(f"✅ Resolved relative URL dynamically to: {submit_url}")
+                    
+                elif match_absolute:
+                    # Standard absolute URL logic (cleanup is still required)
+                    submit_url = match_absolute.group(1).strip().rstrip('.,\'"')
+                    
+                    # Final check to ensure the URL looks like a submission endpoint
+                    if any(keyword in submit_url.lower() for keyword in ["submit", "answer", "demo"]):
+                        url_found = True
+                    else:
+                        submit_url = None # Not a submission URL, likely a file link
+                        
             # 3. IF URL IS STILL MISSING: STOP THE LOOP
             if not url_found:
-                print("❌ CRITICAL FAILURE: Could not find a submission URL after AI and regex search. Stopping agent.")
-                break # Stop the while loop to prevent the TypeError
+                print("❌ CRITICAL FAILURE: Could not find a submission URL after AI and dynamic regex search. Stopping agent.")
+                # Log the text so you can inspect where the URL is
+                print("--- PAGE TEXT SNIPPET (First 1000 characters) ---")
+                print(text[:1000]) 
+                print("--------------------------------------------------")
+                break # Stop the while loop
                 
             # Step C: Execute (using the updated function that returns "CODE_EXECUTION_FAILED")
             raw_answer = execute_code(code)
