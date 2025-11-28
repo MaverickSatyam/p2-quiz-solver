@@ -75,8 +75,9 @@ async def download_files(links):
     return local_files
 
 # --- 4. AI CODE GENERATOR ---
-async def generate_solution(instruction, file_paths):
+async def generate_solution(instruction, file_paths, current_url_base=None):
     files_context = "\n".join([f"- {path}" for path in file_paths])
+    base_url_context = f"\nCURRENT PAGE BASE URL: {current_url_base}" if current_url_base else ""
     
     system_prompt = f"""
         You are an autonomous Python data analyst. Your ONLY goal is to solve the task.
@@ -101,6 +102,7 @@ async def generate_solution(instruction, file_paths):
     user_prompt = f"""
     Context Files:
     {files_context}
+    {base_url_context}
     
     Instruction:
     {instruction}
@@ -159,8 +161,12 @@ async def run_quiz_agent(start_url, email, secret):
             text, links = await get_task_context(current_url)
             files = await download_files(links)
 
+            # Extract the base URL for the AI to use in its script
+            url_parts = urlparse(current_url)
+            base_url = f"{url_parts.scheme}://{url_parts.netloc}"
+
             # ... Step B: Ask AI
-            plan = await generate_solution(text, files)
+            plan = await generate_solution(text, files, base_url)
             code = plan.get("python_code")
             submit_url = plan.get("submit_url")
 
@@ -182,7 +188,7 @@ async def run_quiz_agent(start_url, email, secret):
                 
                 # Regex 1: Look for any relative path that starts with a slash (/) and contains 'submit', 'answer', or 'post'
                 # This is more dynamic than just looking for '/submit'
-                match_relative = re.search(r'(/[^/\s]+(?:submit|answer|post|quiz)[^\s]*)', text, re.IGNORECASE)
+                match_relative = re.search(r'(/submit[^\s]*)', text, re.IGNORECASE)
                 
                 # Regex 2: Look for full https:// or http:// URL
                 match_absolute = re.search(r'(https?://[^\s]+)', text, re.IGNORECASE)
@@ -192,7 +198,7 @@ async def run_quiz_agent(start_url, email, secret):
                     relative_path = match_relative.group(1).strip().rstrip('.,\'"')
                     
                     # urljoin handles combining the current page's base with the relative path gracefully.
-                    submit_url = urljoin(current_url, relative_path)
+                    submit_url = urljoin(base_url, relative_path)
                     url_found = True
                     print(f"✅ Resolved relative URL dynamically to: {submit_url}")
                     
