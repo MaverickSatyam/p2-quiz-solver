@@ -18,7 +18,7 @@ client = AsyncOpenAI(
     api_key=os.getenv("AIPIPE_TOKEN"),
     base_url="https://aipipe.org/openrouter/v1"
 )
-AI_MODEL = "openai/gpt-4.1-nano"  # Use high-quality model for coding tasks
+AI_MODEL = "openai/gpt-4.1-nano"
 
 # Workspace for downloaded files
 WORKSPACE_DIR = "./workspace"
@@ -35,7 +35,7 @@ async def get_task_context(url: str):
         try:
             await page.goto(url, timeout=20000)
             await page.wait_for_load_state("networkidle")
-            await page.wait_for_timeout(2000) # Wait for JS rendering
+            await page.wait_for_timeout(2000)
 
             visible_text = await page.inner_text("body")
             
@@ -53,7 +53,7 @@ async def get_task_context(url: str):
             await browser.close()
             raise e
 
-# --- 3. DOWNLOADER ---
+# --- 3. DOWNLOADER AND FILE READER ---
 async def download_files(links):
     local_files = []
     async with httpx.AsyncClient() as client:
@@ -74,10 +74,33 @@ async def download_files(links):
                     print(f"⚠️  Download failed: {e}")
     return local_files
 
-# --- 4. AI CODE GENERATOR ---
-async def generate_solution(instruction, file_paths, current_url_base=None):
+def get_file_contents_for_prompt(files):
+    """Reads the content of downloaded files for inclusion in the prompt."""
+    contents = {}
+    for filepath in files:
+        if os.path.getsize(filepath) > 200000: # Limit to 200KB for prompt inclusion
+            contents[filepath] = "File too large to include in prompt."
+            continue
+            
+        try:
+            with open(filepath, 'r') as f:
+                # Read max 20,000 characters to prevent context overflow
+                contents[filepath] = f.read(20000) 
+        except Exception as e:
+            contents[filepath] = f"Error reading file: {e}"
+            
+    return "\n\n".join([f"--- FILE: {path} (Snippet) ---\n{content}" for path, content in contents.items()])
+
+# --- 4. AI CODE GENERATOR (Modified Signature) ---
+async def generate_solution(instruction, file_paths, current_url_base, all_links, previous_error=None):
     files_context = "\n".join([f"- {path}" for path in file_paths])
     base_url_context = f"\nCURRENT PAGE BASE URL: {current_url_base}" if current_url_base else ""
+    links_context = "\n".join([f"- Text: {link['text']}, URL: {link['href']}" for link in all_links])
+
+    # Dynamic Hinting based on previous error
+    failure_context = ""
+    if previous_error:
+        failure_context = f"\n--- PREVIOUS ATTEMPT FAILED ---\nReason: {previous_error}\nYour previous answer was rejected. Write robust code to solve it."
     
     system_prompt = f"""
         You are an autonomous Python data analyst. Your ONLY goal is to solve the task.
@@ -87,25 +110,26 @@ async def generate_solution(instruction, file_paths, current_url_base=None):
         The JSON object MUST have two keys: "submit_url" (string) and "python_code" (string).
         
         Rules for the 'python_code' value:
-        1. The code must be a single, complete Python script string (do NOT wrap it in ```python).
-        2. The script must read the instructions and files, calculate the final answer.
+        1. The code must be a single, complete Python script string. DO NOT wrap it in ```python.
+        2. The script must read the instructions and files, and calculate the final answer.
         3. The script MUST print the FINAL ANSWER to stdout ONLY.
-        
-        Rules for the 'submit_url' value:
-        1. Extract the submission URL from the instructions. It can be relative (e.g., /submit) or absolute.
-        2. If no files are listed in the Context Files section, ignore the file_paths.
+        4. If using the 'requests' library for submission, it MUST use the **json=** argument.
+        5. When using Pandas, do NOT hardcode column names. Access the first column using **df.iloc[:, 0]**.
         
         Context Files:
         {files_context}
         """
     
     user_prompt = f"""
-    Context Files:
-    {files_context}
     {base_url_context}
+    
+    Relevant Links found on the page:
+    {links_context}
     
     Instruction:
     {instruction}
+    
+    {failure_context}
     """
 
     response = await client.chat.completions.create(
@@ -119,17 +143,21 @@ async def generate_solution(instruction, file_paths, current_url_base=None):
     
     return json.loads(response.choices[0].message.content)
 
-# --- 4b. AI ANSWER DELEGATOR ---
+# --- 4b. AI ANSWER DELEGATOR (Modified Signature) ---
 @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=2, max=5), 
        retry=retry_if_exception_type(json.JSONDecodeError))
-async def delegate_to_llm_answer(instruction, file_paths, current_url_base=None):
+async def delegate_to_llm_answer(instruction, file_paths, current_url_base, file_contents, previous_error=None):
     """Asks the AI to solve the task directly and output ONLY the answer."""
     files_context = "\n".join([f"- {path}" for path in file_paths])
     base_url_context = f"\nCURRENT PAGE BASE URL: {current_url_base}" if current_url_base else ""
     
-    # System prompt to force a direct answer
+    # Dynamic Hinting based on previous error
+    failure_context = ""
+    if previous_error:
+        failure_context = f"\n--- PREVIOUS ATTEMPT FAILED ---\nReason: {previous_error}\nYour previous answer was rejected. Try a different approach."
+
     system_prompt = f"""
-        You are an expert data analyst. Your ONLY goal is to solve the task described in the Instruction using the Context.
+        You are an expert data analyst. Your ONLY goal is to solve the task described in the Instruction and Context.
         You MUST provide the final answer as a clean string. DO NOT include any text, conversation, code blocks, or markdown.
         
         Context Files:
@@ -139,8 +167,13 @@ async def delegate_to_llm_answer(instruction, file_paths, current_url_base=None)
     user_prompt = f"""
     {base_url_context}
     
-    Instruction:
+    --- PAGE CONTENT ---
     {instruction}
+    
+    --- FILE SNIPPET DATA ---
+    {file_contents}
+    
+    {failure_context}
     
     Provide the final numerical or string answer ONLY:
     """
@@ -153,7 +186,6 @@ async def delegate_to_llm_answer(instruction, file_paths, current_url_base=None)
         ]
     )
     
-    # Clean up the raw response text
     raw_answer = response.choices[0].message.content.strip()
     return raw_answer.replace('"', '').strip()
 
@@ -161,7 +193,6 @@ async def delegate_to_llm_answer(instruction, file_paths, current_url_base=None)
 def execute_code(code):
     print("🚀 Executing Solution Code...")
     try:
-        # Run python code in a subprocess
         result = subprocess.run(
             ["python3", "-c", code],
             capture_output=True,
@@ -170,7 +201,6 @@ def execute_code(code):
         )
         if result.returncode != 0:
             print(f"⚠️ Code Execution Failed. Error: {result.stderr}")
-            # If code fails, return a specific failure string, NOT None
             return "CODE_EXECUTION_FAILED" 
             
         return result.stdout.strip()
@@ -190,20 +220,17 @@ async def submit_answer(url, payload):
 
 # --- Helper function for answer normalization ---
 def normalize_answer(raw_answer):
-    """Cleans up and converts the answer to the appropriate format (float/int/string)."""
     if not raw_answer or raw_answer == "CODE_EXECUTION_FAILED":
         return None
         
     final_answer = raw_answer.replace('"', '').strip()
     try:
-        # Check if it is a number (integer or float)
         if final_answer.isdigit() or final_answer.count('.') == 1 and final_answer.replace('.', '').isdigit():
             return float(final_answer)
         else:
             return final_answer
     except:
-        return raw_answer # Fallback to original raw string
-
+        return raw_answer
 
 # --- 7. MAIN LOOP ---
 async def run_quiz_agent(start_url, email, secret):
@@ -213,30 +240,31 @@ async def run_quiz_agent(start_url, email, secret):
         print(f"\n🔵 Processing: {current_url}")
         
         # We will attempt Phase 1 first.
-        result = {"correct": False} # Initialize result to trigger logic
+        result = {"correct": False}
+        previous_error = None # Tracks the reason for failure
         
         try:
             # --- PHASE 0: Initial Setup ---
             text, links = await get_task_context(current_url)
             files = await download_files(links)
+            file_contents = get_file_contents_for_prompt(files)
+            
             url_parts = urlparse(current_url)
             base_url = f"{url_parts.scheme}://{url_parts.netloc}"
             
-            # We need the submit URL for both phases. Generate the plan once for the URL.
-            plan_for_url = await generate_solution(text, files, base_url)
+            # --- URL VALIDATION (Generate plan once to find the URL) ---
+            # Call generate_solution once to get the potential submit URL and links context
+            plan_for_url = await generate_solution(text, files, base_url, links)
             current_submit_url = plan_for_url.get("submit_url")
             
-            # --- URL VALIDATION (REQUIRED BEFORE ANY SUBMISSION) ---
             url_found = False
             submit_url = current_submit_url
             
-            
-            # 1. Check AI result first (prefers AI's output)
+            # 1. Check AI result first
             if submit_url and submit_url.startswith('https'):
                 url_found = True
             else:
-                # 2. Fallback: Search the entire page text for either a full URL or a relative path
-                print("⚠️ AI missed the submit URL, applying dynamic fallback search...")
+                # 2. Fallback: Search the entire page text for URL
                 match_relative = re.search(r'(/submit[^\s]*)', text, re.IGNORECASE)
                 match_absolute = re.search(r'(https?://[^\s]+)', text, re.IGNORECASE)
 
@@ -244,7 +272,6 @@ async def run_quiz_agent(start_url, email, secret):
                     relative_path = match_relative.group(1).strip().rstrip('.,\'"')
                     submit_url = urljoin(base_url, relative_path)
                     url_found = True
-                    print(f"✅ Resolved relative URL dynamically to: {submit_url}")
                 elif match_absolute:
                     submit_url = match_absolute.group(1).strip().rstrip('.,\'"')
                     if any(keyword in submit_url.lower() for keyword in ["submit", "answer", "demo"]):
@@ -252,16 +279,18 @@ async def run_quiz_agent(start_url, email, secret):
                     else:
                         submit_url = None
                         
-            # 3. IF URL IS STILL MISSING: BREAK
             if not url_found or not submit_url:
-                print("❌ CRITICAL FAILURE: Could not find a submission URL after AI and dynamic regex search. Stopping agent.")
+                print("❌ CRITICAL FAILURE: Could not find a submission URL. Stopping agent.")
                 break 
 
             # --- ATTEMPT 1: LLM DELEGATION (Primary Method) ---
             answer_source = "Delegation"
+            raw_answer = None
+            
             try:
                 print(f"\n✨ Attempt 1 ({answer_source}): LLM Delegation (Direct Answer)")
-                raw_answer = await delegate_to_llm_answer(text, files, base_url)
+                # Pass all context, including file snippets
+                raw_answer = await delegate_to_llm_answer(text, files, base_url, file_contents)
                 answer = normalize_answer(raw_answer)
                 
                 if answer:
@@ -272,9 +301,10 @@ async def run_quiz_agent(start_url, email, secret):
                     if result.get("correct"):
                         print("✅ Correct! (Delegation)")
                         current_url = result.get("url")
-                        continue # Move to next loop iteration
+                        continue # Move to next question
                     else:
-                        print(f"❌ Wrong ({answer_source}): {result.get('reason')}")
+                        previous_error = result.get('reason')
+                        print(f"❌ Wrong ({answer_source}): {previous_error}")
                         # If wrong, proceed to Attempt 2.
                 else:
                     print("⚠️ Delegation failed to produce a valid answer. Proceeding to Attempt 2.")
@@ -288,8 +318,8 @@ async def run_quiz_agent(start_url, email, secret):
                 answer_source = "Code"
                 print(f"\n💻 Attempt 2 ({answer_source}): Falling back to AI Code Generation and Execution")
                 
-                # Use the plan already generated, or regenerate the code part if the URL plan was old
-                plan = await generate_solution(text, files, base_url) 
+                # Pass all context, including the reason for the previous failure
+                plan = await generate_solution(text, files, base_url, links, previous_error)
                 code = plan.get("python_code")
                 
                 # --- DEBUG CODE ---
@@ -314,7 +344,6 @@ async def run_quiz_agent(start_url, email, secret):
                     print("❌ Code execution failed or produced no answer. Moving to next URL.")
 
             # --- FINAL LOOP CONTROL ---
-            # Whether Attempt 2 was successful or failed, we must proceed to the next URL.
             current_url = result.get("url") 
             
             # Cleanup
