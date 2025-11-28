@@ -18,7 +18,7 @@ client = AsyncOpenAI(
     api_key=os.getenv("AIPIPE_TOKEN"),
     base_url="https://aipipe.org/openrouter/v1"
 )
-AI_MODEL = "openai/gpt-4o"  # Use high-quality model for coding tasks
+AI_MODEL = "openai/gpt-4.1-nano"  # Use high-quality model for coding tasks
 
 # Workspace for downloaded files
 WORKSPACE_DIR = "./workspace"
@@ -119,6 +119,44 @@ async def generate_solution(instruction, file_paths, current_url_base=None):
     
     return json.loads(response.choices[0].message.content)
 
+# --- 4b. AI ANSWER DELEGATOR ---
+@retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=2, max=5), 
+       retry=retry_if_exception_type(json.JSONDecodeError))
+async def delegate_to_llm_answer(instruction, file_paths, current_url_base=None):
+    """Asks the AI to solve the task directly and output ONLY the answer."""
+    files_context = "\n".join([f"- {path}" for path in file_paths])
+    base_url_context = f"\nCURRENT PAGE BASE URL: {current_url_base}" if current_url_base else ""
+    
+    # System prompt to force a direct answer
+    system_prompt = f"""
+        You are an expert data analyst. Your ONLY goal is to solve the task described in the Instruction using the Context.
+        You MUST provide the final answer as a clean string. DO NOT include any text, conversation, code blocks, or markdown.
+        
+        Context Files:
+        {files_context}
+        """
+    
+    user_prompt = f"""
+    {base_url_context}
+    
+    Instruction:
+    {instruction}
+    
+    Provide the final numerical or string answer ONLY:
+    """
+
+    response = await client.chat.completions.create(
+        model=AI_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+    )
+    
+    # Clean up the raw response text
+    raw_answer = response.choices[0].message.content.strip()
+    return raw_answer.replace('"', '').strip()
+
 # --- 5. EXECUTOR ---
 def execute_code(code):
     print("🚀 Executing Solution Code...")
@@ -150,107 +188,138 @@ async def submit_answer(url, payload):
         resp.raise_for_status()
         return resp.json()
 
+# --- Helper function for answer normalization ---
+def normalize_answer(raw_answer):
+    """Cleans up and converts the answer to the appropriate format (float/int/string)."""
+    if not raw_answer or raw_answer == "CODE_EXECUTION_FAILED":
+        return None
+        
+    final_answer = raw_answer.replace('"', '').strip()
+    try:
+        # Check if it is a number (integer or float)
+        if final_answer.isdigit() or final_answer.count('.') == 1 and final_answer.replace('.', '').isdigit():
+            return float(final_answer)
+        else:
+            return final_answer
+    except:
+        return raw_answer # Fallback to original raw string
+
+
 # --- 7. MAIN LOOP ---
 async def run_quiz_agent(start_url, email, secret):
     current_url = start_url
     
     while current_url:
         print(f"\n🔵 Processing: {current_url}")
+        
+        # We will attempt Phase 1 first.
+        result = {"correct": False} # Initialize result to trigger logic
+        
         try:
-            # Step A: Get Data
+            # --- PHASE 0: Initial Setup ---
             text, links = await get_task_context(current_url)
             files = await download_files(links)
-
-            # Extract the base URL for the AI to use in its script
             url_parts = urlparse(current_url)
             base_url = f"{url_parts.scheme}://{url_parts.netloc}"
-
-            # ... Step B: Ask AI
-            plan = await generate_solution(text, files, base_url)
-            code = plan.get("python_code")
-            submit_url = plan.get("submit_url")
-
-            # --- DEBUG CODE ---
-            print("\n--- AI GENERATED CODE START ---")
-            print(code)
-            print("--- AI GENERATED CODE END ---\n")
-            # ------------------
-
-            # CRITICAL: Step B/C - Robust URL Extraction and Validation
+            
+            # We need the submit URL for both phases. Generate the plan once for the URL.
+            plan_for_url = await generate_solution(text, files, base_url)
+            current_submit_url = plan_for_url.get("submit_url")
+            
+            # --- URL VALIDATION (REQUIRED BEFORE ANY SUBMISSION) ---
             url_found = False
-
+            submit_url = current_submit_url
+            
             # 1. Check AI result first (prefers AI's output)
-            if submit_url and submit_url.startswith('http'):
+            if submit_url and submit_url.startswith('https'):
                 url_found = True
             else:
                 # 2. Fallback: Search the entire page text for either a full URL or a relative path
                 print("⚠️ AI missed the submit URL, applying dynamic fallback search...")
-                
-                # Regex 1: Look for any relative path that starts with a slash (/) and contains 'submit', 'answer', or 'post'
-                # This is more dynamic than just looking for '/submit'
                 match_relative = re.search(r'(/submit[^\s]*)', text, re.IGNORECASE)
-                
-                # Regex 2: Look for full https:// or http:// URL
                 match_absolute = re.search(r'(https?://[^\s]+)', text, re.IGNORECASE)
 
                 if match_relative:
-                    # **NEW DYNAMIC LOGIC:** Use urljoin to correctly combine base URL and relative path
                     relative_path = match_relative.group(1).strip().rstrip('.,\'"')
-                    
-                    # urljoin handles combining the current page's base with the relative path gracefully.
                     submit_url = urljoin(base_url, relative_path)
                     url_found = True
                     print(f"✅ Resolved relative URL dynamically to: {submit_url}")
-                    
                 elif match_absolute:
-                    # Standard absolute URL logic (cleanup is still required)
                     submit_url = match_absolute.group(1).strip().rstrip('.,\'"')
-                    
-                    # Final check to ensure the URL looks like a submission endpoint
                     if any(keyword in submit_url.lower() for keyword in ["submit", "answer", "demo"]):
                         url_found = True
                     else:
-                        submit_url = None # Not a submission URL, likely a file link
+                        submit_url = None
                         
-            # 3. IF URL IS STILL MISSING: STOP THE LOOP
-            if not url_found:
+            # 3. IF URL IS STILL MISSING: BREAK
+            if not url_found or not submit_url:
                 print("❌ CRITICAL FAILURE: Could not find a submission URL after AI and dynamic regex search. Stopping agent.")
-                # Log the text so you can inspect where the URL is
-                print("--- PAGE TEXT SNIPPET (First 1000 characters) ---")
-                print(text[:1000]) 
-                print("--------------------------------------------------")
-                break # Stop the while loop
+                break 
+
+            # --- ATTEMPT 1: LLM DELEGATION (Primary Method) ---
+            answer_source = "Delegation"
+            try:
+                print(f"\n✨ Attempt 1 ({answer_source}): LLM Delegation (Direct Answer)")
+                raw_answer = await delegate_to_llm_answer(text, files, base_url)
+                answer = normalize_answer(raw_answer)
                 
-            # Step C: Execute (using the updated function that returns "CODE_EXECUTION_FAILED")
-            raw_answer = execute_code(code)
+                if answer:
+                    print(f"💡 Answer ({answer_source}): {answer}")
+                    payload = {"email": email, "secret": secret, "url": current_url, "answer": answer}
+                    result = await submit_answer(submit_url, payload)
+                    
+                    if result.get("correct"):
+                        print("✅ Correct! (Delegation)")
+                        current_url = result.get("url")
+                        continue # Move to next loop iteration
+                    else:
+                        print(f"❌ Wrong ({answer_source}): {result.get('reason')}")
+                        # If wrong, proceed to Attempt 2.
+                else:
+                    print("⚠️ Delegation failed to produce a valid answer. Proceeding to Attempt 2.")
+
+            except Exception as e:
+                print(f"⚠️ Delegation attempt failed: {e}. Proceeding to Attempt 2.")
             
-            # Clean answer (remove quotes if AI printed them)
-            if raw_answer:
-                answer = raw_answer.replace('"', '').strip()
-                # Try converting to number if applicable
-                if answer.isdigit(): answer = int(answer)
-            else:
-                answer = "Error"
-
-            print(f"💡 Answer: {answer}")
-
-            # Step D: Submit
-            payload = {"email": email, "secret": secret, "url": current_url, "answer": answer}
-            result = await submit_answer(submit_url, payload)
             
-            # Step E: Next?
-            if result.get("correct"):
-                print(result.get("correct"))
-                print("✅ Correct!")
-                current_url = result.get("url")
-            else:
-                print(f"❌ Wrong: {result.get('reason')}")
-                current_url = result.get("url") # Skip to next even if wrong (per prompt rules)
+            # --- ATTEMPT 2: AI CODE EXECUTION (Fallback Method) ---
+            if not result.get("correct"):
+                answer_source = "Code"
+                print(f"\n💻 Attempt 2 ({answer_source}): Falling back to AI Code Generation and Execution")
+                
+                # Use the plan already generated, or regenerate the code part if the URL plan was old
+                plan = await generate_solution(text, files, base_url) 
+                code = plan.get("python_code")
+                
+                # --- DEBUG CODE ---
+                print("\n--- AI GENERATED CODE START ---")
+                print(code)
+                print("--- AI GENERATED CODE END ---\n")
+                # ------------------
+                
+                raw_answer = execute_code(code)
+                answer = normalize_answer(raw_answer)
 
+                if answer:
+                    print(f"💡 Answer ({answer_source}): {answer}")
+                    payload = {"email": email, "secret": secret, "url": current_url, "answer": answer}
+                    result = await submit_answer(submit_url, payload)
+                    
+                    if result.get("correct"):
+                        print("✅ Correct! (Code)")
+                    else:
+                        print(f"❌ Wrong ({answer_source}): {result.get('reason')}")
+                else:
+                    print("❌ Code execution failed or produced no answer. Moving to next URL.")
+
+            # --- FINAL LOOP CONTROL ---
+            # Whether Attempt 2 was successful or failed, we must proceed to the next URL.
+            current_url = result.get("url") 
+            
             # Cleanup
             for f in files: os.remove(f)
 
         except Exception as e:
-            print(f"🔥 Error: {e}")
+            print(f"🔥 Critical Error during processing: {e}")
             traceback.print_exc()
             break
